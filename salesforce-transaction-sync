@@ -1,0 +1,2069 @@
+import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
+import { createClient, SupabaseClient } from 'jsr:@supabase/supabase-js@2';
+import { callSalesforceAPI } from '../_shared/salesforce-auth.ts';
+
+// Simple logger for Edge Function
+const logger = {
+  info: (...args: unknown[]) => console.log('[INFO]', ...args),
+  error: (...args: unknown[]) => console.error('[ERROR]', ...args),
+  warn: (...args: unknown[]) => console.warn('[WARN]', ...args),
+};
+
+const SALESFORCE_API_VERSION = 'v61.0';
+// Salesforce User ID fallback when selector owner is不明
+const FALLBACK_OWNER_ID = Deno.env.get('SALESFORCE_FALLBACK_OWNER_ID');
+const responsibleOwnerCache = new Map<string, string | null>();
+const RPC_CHUNK_SIZE = 200;
+const MAX_OBJECT_RETRIES = 3;
+
+// UUID validation regex
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidUUID(value: string | null | undefined): value is string {
+  if (!value) return false;
+  return UUID_REGEX.test(value);
+}
+
+
+type SalesforceQueryResponse<T> = {
+  totalSize: number;
+  done: boolean;
+  records: T[];
+  nextRecordsUrl?: string | null;
+};
+
+type SyncCursorRecord = {
+  object_name: string;
+  last_synced_at: string | null;
+  last_synced_ids: string[] | null;
+};
+
+function chunkArray<T>(items: T[], chunkSize: number): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    result.push(items.slice(index, index + chunkSize));
+  }
+  return result;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function toUnixMs(value: string): number | null {
+  const date = new Date(value);
+  const time = date.getTime();
+  return Number.isFinite(time) ? time : null;
+}
+
+function toIsoString(timeMs: number | null): string | null {
+  if (!Number.isFinite(timeMs)) return null;
+  const date = new Date(timeMs as number);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function normalizeSalesforceTimestamp(source: string): string | null {
+  const timeMs = toUnixMs(source);
+  return toIsoString(timeMs);
+}
+
+function filterByCursor<T extends { LastModifiedDate?: string; Id?: string }>(
+  records: T[],
+  lastSyncedIso: string | null,
+  processedIds: string[]
+): T[] {
+  if (!lastSyncedIso) return records;
+  const baselineMs = toUnixMs(lastSyncedIso);
+  if (baselineMs === null) return records;
+  const processedSet = new Set(processedIds);
+
+  return records.filter((record) => {
+    const lastModified = typeof record.LastModifiedDate === 'string' ? record.LastModifiedDate : null;
+    if (!lastModified) return true;
+    const recordMs = toUnixMs(lastModified);
+    if (recordMs === null) return true;
+    if (recordMs > baselineMs) return true;
+    if (recordMs === baselineMs) {
+      const recordId = typeof record.Id === 'string' ? record.Id : null;
+      if (!recordId) return true;
+      return !processedSet.has(recordId);
+    }
+    return false;
+  });
+}
+
+function collectIdsAtTimestamp<T extends { LastModifiedDate?: string; Id?: string }>(
+  records: T[],
+  targetIso: string | null
+): string[] {
+  if (!targetIso) return [];
+  const targetMs = toUnixMs(targetIso);
+  if (targetMs === null) return [];
+
+  return records
+    .filter((record) => {
+      const lastModified = typeof record.LastModifiedDate === 'string' ? record.LastModifiedDate : null;
+      if (!lastModified) return false;
+      const recordMs = toUnixMs(lastModified);
+      return recordMs !== null && recordMs === targetMs;
+    })
+    .map((record) => (typeof record.Id === 'string' ? record.Id : null))
+    .filter((id): id is string => !!id);
+}
+
+async function getSyncCursor(
+  supabase: SupabaseClient,
+  objectName: string
+): Promise<SyncCursorRecord | null> {
+  const { data, error } = await supabase.rpc('get_salesforce_sync_cursor', {
+    p_object_name: objectName,
+  });
+
+  if (error) {
+    throw new Error(`sync_cursors 取得エラー (${objectName}): ${error.message}`);
+  }
+
+  const row = Array.isArray(data)
+    ? (data[0] as SyncCursorRecord | undefined)
+    : (data as SyncCursorRecord | null);
+  if (!row) {
+    return null;
+  }
+
+  const ids = Array.isArray(row.last_synced_ids)
+    ? row.last_synced_ids.filter((value): value is string => typeof value === 'string')
+    : null;
+
+  return {
+    object_name: row.object_name,
+    last_synced_at: row.last_synced_at ?? null,
+    last_synced_ids: ids,
+  };
+}
+
+async function saveSyncCursor(
+  supabase: SupabaseClient,
+  objectName: string,
+  timestampIso: string | null,
+  idsAtTimestamp: string[]
+): Promise<void> {
+  const auditTime = new Date().toISOString();
+  const { error } = await supabase.rpc('update_salesforce_sync_cursor', {
+    p_object_name: objectName,
+    p_last_synced_at: timestampIso,
+    p_last_synced_ids: idsAtTimestamp.length > 0 ? idsAtTimestamp : null,
+    p_audit_time: auditTime,
+  });
+  if (error) {
+    throw new Error(`sync_cursors upsertエラー (${objectName}): ${error.message}`);
+  }
+}
+
+async function fetchSalesforceQueryAll<T>(
+  supabase: SupabaseClient,
+  soql: string,
+  batchSize: number,
+  stats?: SyncStats,
+  initialPath?: string
+): Promise<T[]> {
+  const headers = batchSize > 0
+    ? { 'Sforce-Query-Options': `batchSize=${Math.min(batchSize, 2000)}` }
+    : undefined;
+  
+  let path: string | null = initialPath 
+    ? initialPath 
+    : `/services/data/${SALESFORCE_API_VERSION}/query?q=${encodeURIComponent(soql)}`;
+  
+  const aggregated: T[] = [];
+
+  while (path) {
+    if (stats) stats.salesforceRequestCount += 1;
+    const page = await callSalesforceAPI<SalesforceQueryResponse<T>>(supabase, path, {
+      method: 'GET',
+      headers,
+    });
+    if (Array.isArray(page.records)) {
+      aggregated.push(...page.records);
+    }
+    path = typeof page.nextRecordsUrl === 'string' && page.nextRecordsUrl.length > 0
+      ? page.nextRecordsUrl
+      : null;
+  }
+
+  return aggregated;
+}
+
+function computeMaxTimestamp<T extends { LastModifiedDate?: string }>(records: T[]): string | null {
+  let maxMs: number | null = null;
+  for (const record of records) {
+    const lastModified = typeof record.LastModifiedDate === 'string' ? record.LastModifiedDate : null;
+    const recordMs = lastModified ? toUnixMs(lastModified) : null;
+    if (recordMs !== null && (maxMs === null || recordMs > maxMs)) {
+      maxMs = recordMs;
+    }
+  }
+  return toIsoString(maxMs);
+}
+
+function toSoqlDateTimeLiteral(iso: string): string {
+  const normalized = iso?.trim();
+  if (!normalized) {
+    throw new Error('SOQL用の日時リテラルが空です');
+  }
+
+  const hasTimezone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized);
+  const literal = hasTimezone ? normalized : `${normalized}Z`;
+
+  return literal;
+}
+
+type SyncResultCounterKey =
+  | 'photographingInformations'
+  | 'orderDetails'
+  | 'paymentManagements'
+  | 'accounts'
+  | 'contacts';
+
+type SyncStats = {
+  salesforceRequestCount: number;
+  databaseOperationCount: number;
+};
+
+type SyncResults = {
+  photographingInformations: number;
+  orderDetails: number;
+  paymentManagements: number;
+  accounts: number;
+  contacts: number;
+  errors: string[];
+  syncMode: 'incremental' | 'full';
+  processedObjects: string[];
+  salesforceRequestCount: number;
+  databaseOperationCount: number;
+};
+
+type ObjectSyncContext = {
+  supabase: SupabaseClient;
+  syncMode: 'incremental' | 'full';
+  batchSize: number;
+  storeId?: string;
+  stats: SyncStats;
+};
+
+type ObjectSyncDefinition<TRecord> = {
+  objectName: string;
+  fields: string[];
+  baseConditions: string[];
+  storeCondition?: (storeId: string) => string;
+  rpcName: string;
+  resultKey: SyncResultCounterKey;
+  mapRecord: (record: TRecord) => Record<string, unknown>;
+};
+
+async function syncSalesforceObject<TRecord extends { LastModifiedDate?: string; Id?: string }>(
+  definition: ObjectSyncDefinition<TRecord>,
+  context: ObjectSyncContext,
+  results: SyncResults
+): Promise<void> {
+  const { supabase, syncMode, batchSize, storeId, stats } = context;
+  const cursor = syncMode === 'full' ? null : await getSyncCursor(supabase, definition.objectName);
+  const lastSyncedIso = cursor?.last_synced_at ? normalizeSalesforceTimestamp(cursor.last_synced_at) : null;
+  const processedIds = Array.isArray(cursor?.last_synced_ids)
+    ? cursor?.last_synced_ids.filter((id): id is string => typeof id === 'string')
+    : [];
+
+  const conditions: string[] = [...definition.baseConditions];
+  if (storeId && definition.storeCondition) {
+    conditions.push(definition.storeCondition(storeId));
+  }
+  if (syncMode === 'incremental' && lastSyncedIso) {
+    conditions.push(`LastModifiedDate >= ${toSoqlDateTimeLiteral(lastSyncedIso)}`);
+  }
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const soql = `SELECT ${definition.fields.join(', ')} FROM ${definition.objectName} ${whereClause} ORDER BY LastModifiedDate ASC`;
+
+  logger.info(`📡 ${definition.objectName} SOQL`, { soql });
+  const records = await fetchSalesforceQueryAll<TRecord>(supabase, soql, batchSize, stats);
+  logger.info(`📊 ${definition.objectName}取得結果`, {
+    fetched: records.length,
+    syncMode,
+  });
+
+  const filtered = syncMode === 'incremental'
+    ? filterByCursor(records, lastSyncedIso, processedIds)
+    : records;
+
+  if (filtered.length === 0) {
+    if (syncMode === 'incremental') {
+      await saveSyncCursor(supabase, definition.objectName, lastSyncedIso, processedIds);
+    }
+    logger.info(`ℹ️ ${definition.objectName}: 差分なし`);
+    results.processedObjects.push(definition.objectName);
+    return;
+  }
+
+  let syncedCount = 0;
+  for (const chunk of chunkArray(filtered, RPC_CHUNK_SIZE)) {
+    const payload = chunk.map(definition.mapRecord);
+    stats.databaseOperationCount += 1;
+    const { data, error } = await supabase.rpc(definition.rpcName, {
+      p_records: payload,
+    });
+    if (error) {
+      throw new Error(`${definition.rpcName} エラー: ${error.message}`);
+    }
+    const increment = typeof data === 'number' ? data : payload.length;
+    syncedCount += increment;
+  }
+
+  const maxTimestamp = computeMaxTimestamp(filtered) ?? new Date().toISOString();
+  const idsAtMax = collectIdsAtTimestamp(filtered, maxTimestamp);
+  await saveSyncCursor(supabase, definition.objectName, maxTimestamp, idsAtMax);
+
+  results[definition.resultKey] += syncedCount;
+  results.processedObjects.push(definition.objectName);
+  logger.info(`✅ ${definition.objectName}: ${syncedCount}件同期完了`, {
+    processed: filtered.length,
+    lastSyncedAt: maxTimestamp,
+  });
+}
+
+/**
+ * Salesforce Transaction Sync - 統合版Edge Function
+ *
+ * denpyo-sync + transaction-sync を1つに統合
+ * - direction: 'push' → Supabase → Salesforce（伝票送信）
+ * - direction: 'pull' → Salesforce → Supabase（履歴取得）
+ *
+ * DRY / KISS / 型安全 を優先
+ */
+
+// === 共通型定義 ===
+
+interface SyncRequest {
+  direction: 'push' | 'pull';
+
+  // Push用パラメータ
+  denpyoIds?: string[];
+  batchSize?: number;
+
+  // Pull用パラメータ
+  limit?: number;
+  storeId?: string;
+  syncMode?: 'incremental' | 'full';
+
+  // 共通
+  isManual?: boolean;
+  triggeredBy?: string;
+}
+
+interface SyncResponse {
+  success: boolean;
+  data?: Record<string, unknown>;
+  message?: string;
+}
+
+// Salesforce型定義
+interface SalesforceAccount {
+  OwnerId?: string;
+  Name: string;
+  Phone?: string;
+  MobilePhone2__c?: string;
+  Kana__c?: string;
+  BillingStreet?: string;
+  BillingCity?: string;
+  BillingState?: string;
+  BillingPostalCode?: string;
+  BillingCountry?: string;
+  Email__c?: string;
+  FirstVisitStore__c?: string;
+  Description?: string;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+function isJsonRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getString(value: unknown): string | undefined {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+function getNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function getBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true' || normalized === '1') return true;
+    if (normalized === 'false' || normalized === '0') return false;
+  }
+  if (typeof value === 'number') {
+    return value !== 0;
+  }
+  return undefined;
+}
+
+function getStringProp(record: JsonRecord, key: string): string | undefined {
+  return getString(record[key]);
+}
+
+function getNumberProp(record: JsonRecord, key: string): number | undefined {
+  return getNumber(record[key]);
+}
+
+type PartnerFlagValue = '有' | '無';
+
+function getBooleanProp(record: JsonRecord, key: string): boolean | undefined {
+  return getBoolean(record[key]);
+}
+
+function getPartnerFlagProp(record: JsonRecord, key: string): PartnerFlagValue | undefined {
+  const raw = record[key];
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === '有' || trimmed === '無') {
+    return trimmed;
+  }
+  return undefined;
+}
+
+interface AccountData {
+  appId?: string;
+  name?: string;
+  billingStreet?: string;
+  billingCity?: string;
+  billingState?: string;
+  billingPostalCode?: string;
+  billingCountry?: string;
+  phone?: string;
+  mobilePhone2?: string;
+  email?: string;
+  kana?: string;
+  firstVisitStore?: string;
+  description?: string;
+}
+
+interface ContactData {
+  appId?: string;
+  accountAppId?: string;
+  lastName?: string;
+  firstName?: string;
+  mailingStreet?: string;
+  mailingCity?: string;
+  mailingState?: string;
+  mailingPostalCode?: string;
+  phone?: string;
+  email?: string;
+  kana?: string;
+  relationship?: string;
+}
+
+interface PhotographingData {
+  appId?: string;
+  shootingDate?: string;
+  studio?: string;
+  clientAccountAppId?: string;
+  partnerAccountAppId?: string;
+  introductionCustomerAccountAppId?: string;
+  photographerSfid18?: string;
+  referralStaffSfid18?: string;
+  selectorSfid18?: string;
+  newRepeat?: string;
+  selectIncomplete?: boolean;
+  introductionText?: string;
+  amountPaidCustomer?: number;
+  amountPaidCompany?: number;
+  paymentStatus?: string;
+  campaign?: string;
+  shootMajor2?: string;
+  shootSub2?: string;
+  field1?: string;
+  sampleWeb?: string;
+  introductionFlag?: string;
+  onlineS?: boolean;
+  field4?: string;
+  partnerFlag?: PartnerFlagValue;
+  visitedRoute2?: string;
+  choseReason?: string;
+  introductionBonusContent?: string;
+}
+
+interface OrderItem {
+  appId?: string;
+  photographingInformationAppId?: string;
+  salesDate?: string;
+  shootingDate?: string;
+  billingAddress?: string;
+  majorDivisions?: string;
+  mediumSegment?: string;
+  subCategory?: string;
+  store?: string;
+  quantity?: number;
+  unitPrice?: number;
+  amount?: number;
+  remarks?: string;
+  serviceItem?: boolean;
+}
+
+interface PaymentItem {
+  appId?: string;
+  photographingInformationAppId?: string;
+  paymentClassification?: string;
+  paymentDay?: string;
+  moneyAmount?: number;
+  depositItem?: string;
+  paymentDetails?: string;
+  withdrawalDate?: string;
+  store?: string;
+  bumon?: string;
+  remarks?: string;
+}
+
+interface SalesforceContact {
+  OwnerId?: string;
+  LastName: string;
+  FirstName?: string;
+  Phone?: string;
+  Email?: string;
+  MobilePhone?: string;
+  Kana__c?: string;
+  MailingStreet?: string;
+  MailingCity?: string;
+  MailingState?: string;
+  MailingPostalCode?: string;
+  Relationship__c?: string;
+  Description?: string;
+  Account?: { App_ID__c: string };
+}
+
+interface SalesforcePhotographingInfo {
+  OwnerId?: string;
+  Client__r?: { App_ID__c: string };
+  Partner__r?: { App_ID__c: string };
+  IntroductionCustomer__r?: { App_ID__c: string };
+  ShootingDate__c?: string;
+  ShootMajor2__c?: string;
+  ShootSub2__c?: string;
+  Studio__c?: string;
+  DeliveryDate__c?: string;
+  NewRepeat__c?: string;
+  SelectIncomplete__c?: boolean;
+  IntroductionText__c?: string;
+  AmountPaidCustomer__c?: number;
+  AmountPaidCompany__c?: number;
+  PaymentStatus__c?: string;
+  AccountNameSearch__c?: string;
+  Campaign__c?: string;
+  Photographer__c?: string;
+  ReferralStaff__c?: string;
+  Selector__c?: string;
+  Field1__c?: string;
+  Field4__c?: string;
+  sample_WEB__c?: string;
+  IntroductionFlag__c?: string;
+  Online_S__c?: boolean;
+  Partnerflag__c?: string;
+  VisitedRoute2__c?: string;
+  ChoseReason__c?: string;
+  IntroductionBonusContent__c?: string;
+}
+
+interface SalesforceOrderDetails {
+  SalesDate__c?: string;
+  ShootingDate__c?: string;
+  MajorDivisions__c?: string;
+  MediumSegment__c?: string;
+  SubCategory__c?: string;
+  Store__c?: string;
+  Quantity__c?: number;
+  UnitPrice__c?: number;
+  Amount__c?: number;
+  BillingAddress__c?: string;
+  Remarks__c?: string;
+  ServiceItem__c?: boolean;
+}
+
+interface SalesforcePayment {
+  PaymentClassification__c?: string;
+  PaymentDay__c?: string;
+  MoneyAmount__c?: number;
+  DepositItem__c?: string;
+  PaymentDetails__c?: string;
+  WithdrawalDate__c?: string;
+  Store__c?: string;
+  Bumon__c?: string;
+  Remarks__c?: string;
+}
+
+interface DenpyoViewRow {
+  id: string;
+  storeId?: string | null;
+  storeDisplayName?: string | null;
+  account?: AccountData | null;
+  contact?: ContactData | null;
+  photographing?: PhotographingData | null;
+  customer_name?: string | null;
+  contact_info?: string | null;
+  order_items: OrderItem[];
+  payments: PaymentItem[];
+}
+
+interface DenpyoSyncBatchRow {
+  denpyo_id: string;
+  store_id: string | null;
+  store_display_name: string | null;
+  account_data: unknown;
+  contact_data: unknown;
+  photographing_data: unknown;
+  order_items: unknown;
+  payments: unknown;
+}
+
+function parseAccountData(value: unknown): AccountData | null {
+  if (!isJsonRecord(value)) return null;
+  return {
+    appId: getStringProp(value, 'app_id'),
+    name: getStringProp(value, 'name'),
+    billingStreet: getStringProp(value, 'billing_street'),
+    billingCity: getStringProp(value, 'billing_city'),
+    billingState: getStringProp(value, 'billing_state'),
+    billingPostalCode: getStringProp(value, 'billing_postal_code'),
+    billingCountry: getStringProp(value, 'billing_country'),
+    phone: getStringProp(value, 'phone'),
+    mobilePhone2: getStringProp(value, 'mobile_phone2'),
+    email: getStringProp(value, 'email'),
+    kana: getStringProp(value, 'kana'),
+    firstVisitStore: getStringProp(value, 'first_visit_store'),
+    description: getStringProp(value, 'description'),
+  };
+}
+
+function parseContactData(value: unknown): ContactData | null {
+  if (!isJsonRecord(value)) return null;
+  return {
+    appId: getStringProp(value, 'app_id'),
+    accountAppId: getStringProp(value, 'account_app_id'),
+    lastName: getStringProp(value, 'last_name'),
+    firstName: getStringProp(value, 'first_name'),
+    mailingStreet: getStringProp(value, 'mailing_street'),
+    mailingCity: getStringProp(value, 'mailing_city'),
+    mailingState: getStringProp(value, 'mailing_state'),
+    mailingPostalCode: getStringProp(value, 'mailing_postal_code'),
+    phone: getStringProp(value, 'phone'),
+    email: getStringProp(value, 'email'),
+    kana: getStringProp(value, 'kana'),
+    relationship: getStringProp(value, 'relationship'),
+  };
+}
+
+function parsePhotographingData(value: unknown): PhotographingData | null {
+  if (!isJsonRecord(value)) return null;
+  return {
+    appId: getStringProp(value, 'app_id'),
+    shootingDate: getStringProp(value, 'shooting_date'),
+    studio: getStringProp(value, 'studio'),
+    clientAccountAppId: getStringProp(value, 'client_account_app_id'),
+    partnerAccountAppId: getStringProp(value, 'partner_account_app_id'),
+    introductionCustomerAccountAppId: getStringProp(
+      value,
+      'introduction_customer_account_app_id'
+    ),
+    photographerSfid18: getStringProp(value, 'photographer_sfid_18'),
+    referralStaffSfid18: getStringProp(value, 'referral_staff_sfid_18'),
+    selectorSfid18: getStringProp(value, 'selector_sfid_18'),
+    newRepeat: getStringProp(value, 'new_repeat'),
+    selectIncomplete: getBooleanProp(value, 'select_incomplete'),
+    introductionText: getStringProp(value, 'introduction_text'),
+    amountPaidCustomer: getNumberProp(value, 'amount_paid_customer'),
+    amountPaidCompany: getNumberProp(value, 'amount_paid_company'),
+    paymentStatus: getStringProp(value, 'payment_status'),
+    campaign: getStringProp(value, 'campaign'),
+    shootMajor2: getStringProp(value, 'shoot_major2'),
+    shootSub2: getStringProp(value, 'shoot_sub2'),
+    field1: getStringProp(value, 'field1'),
+    sampleWeb: getStringProp(value, 'sample_web'),
+    introductionFlag: getStringProp(value, 'introduction_flag'),
+    onlineS: getBooleanProp(value, 'online_s'),
+    field4: getStringProp(value, 'field4'),
+    partnerFlag: getPartnerFlagProp(value, 'partnerflag'),
+    visitedRoute2: getStringProp(value, 'visited_route2'),
+    choseReason: getStringProp(value, 'chose_reason'),
+    introductionBonusContent: getStringProp(value, 'introduction_bonus_content'),
+  };
+}
+
+function parseOrderItems(value: unknown): OrderItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!isJsonRecord(item)) return null;
+      return {
+        appId: getStringProp(item, 'app_id'),
+        photographingInformationAppId: getStringProp(
+          item,
+          'photographing_information_app_id'
+        ),
+        salesDate: getStringProp(item, 'sales_date'),
+        shootingDate: getStringProp(item, 'shooting_date'),
+        billingAddress: getStringProp(item, 'billing_address'),
+        majorDivisions: getStringProp(item, 'major_divisions'),
+        mediumSegment: getStringProp(item, 'medium_segment'),
+        subCategory: getStringProp(item, 'sub_category'),
+        store: getStringProp(item, 'store'),
+        quantity: getNumberProp(item, 'quantity'),
+        unitPrice: getNumberProp(item, 'unit_price'),
+        amount: getNumberProp(item, 'amount'),
+        remarks: getStringProp(item, 'remarks'),
+        serviceItem: getBooleanProp(item, 'service_item'),
+      };
+    })
+    .filter((item): item is OrderItem => item !== null);
+}
+
+function parsePayments(value: unknown): PaymentItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!isJsonRecord(item)) return null;
+      return {
+        appId: getStringProp(item, 'app_id'),
+        photographingInformationAppId: getStringProp(
+          item,
+          'photographing_information_app_id'
+        ),
+        paymentClassification: getStringProp(item, 'payment_classification'),
+        paymentDay: getStringProp(item, 'payment_day'),
+        moneyAmount: getNumberProp(item, 'money_amount'),
+        depositItem: getStringProp(item, 'deposit_item'),
+        paymentDetails: getStringProp(item, 'payment_details'),
+        withdrawalDate: getStringProp(item, 'withdrawal_date'),
+        store: getStringProp(item, 'store'),
+        bumon: getStringProp(item, 'bumon'),
+      };
+    })
+    .filter((item): item is PaymentItem => item !== null);
+}
+
+function mapBatchRowToViewRow(row: DenpyoSyncBatchRow): DenpyoViewRow {
+  const account = parseAccountData(row.account_data);
+  const contact = parseContactData(row.contact_data);
+  const photographing = parsePhotographingData(row.photographing_data);
+  const orderItems = parseOrderItems(row.order_items);
+  const payments = parsePayments(row.payments);
+
+  const customerName =
+    account?.name ??
+    (contact
+      ? `${contact.lastName ?? ''}${contact.firstName ? ` ${contact.firstName}` : ''}`.trim() || undefined
+      : undefined);
+
+  const contactInfo = contact?.phone ?? account?.mobilePhone2 ?? account?.phone;
+
+  return {
+    id: row.denpyo_id,
+    storeId: row.store_id,
+    storeDisplayName: row.store_display_name,
+    account,
+    contact,
+    photographing,
+    customer_name: customerName ?? null,
+    contact_info: contactInfo ?? undefined,
+    order_items: orderItems,
+    payments,
+  };
+}
+
+// 環境変数
+const PREFLIGHT_ATTACH_APP_ID =
+  (Deno.env.get('PREFLIGHT_ATTACH_APP_ID') ?? 'true').toLowerCase() === 'true';
+
+// === Push処理（Supabase → Salesforce）===
+
+/**
+ * DenpyoFormViewModel を Salesforce レコード群に変換
+ * - Account / Contact は各自の app_id を使用
+ * - Contact は Account を外部ID参照で関連付け
+ * - OrderDetails / Payment は各行ごとの app_id を必須（無ければスキップ）
+ */
+function transformDenpyoToSalesforce(
+  denpyo: DenpyoViewRow,
+  ownerId?: string
+): {
+  account: { appId: string; payload: SalesforceAccount } | null;
+  contact: { appId: string; payload: SalesforceContact } | null;
+  photographingInfo: { appId: string; payload: SalesforcePhotographingInfo };
+  orderDetails: { appId: string; payload: SalesforceOrderDetails }[];
+  payments: { appId: string; payload: SalesforcePayment }[];
+} {
+  const accountData = denpyo.account ?? null;
+  const contactData = denpyo.contact ?? null;
+  const photographing = denpyo.photographing ?? null;
+
+  const accountAppId = accountData?.appId ?? '';
+  const contactAppId = contactData?.appId ?? '';
+  if (!photographing?.appId) {
+    throw new Error(`PhotographingInformationのapp_idが取得できません（denpyo=${denpyo.id}）`);
+  }
+  const photographingAppId = photographing.appId;
+  const ownerField = ownerId ? { OwnerId: ownerId } : {};
+
+  let account: SalesforceAccount | null = null;
+  if (accountAppId) {
+    account = {
+      ...ownerField,
+      Name: accountData?.name ?? denpyo.customer_name ?? '顧客',
+      Phone: accountData?.phone ?? undefined,
+      MobilePhone2__c: accountData?.mobilePhone2 ?? undefined,
+      Kana__c: accountData?.kana ?? undefined,
+      BillingStreet: accountData?.billingStreet ?? undefined,
+      BillingCity: accountData?.billingCity ?? undefined,
+      BillingState: accountData?.billingState ?? undefined,
+      BillingPostalCode: accountData?.billingPostalCode ?? undefined,
+      BillingCountry: accountData?.billingCountry ?? undefined,
+      Email__c: accountData?.email ?? undefined,
+      FirstVisitStore__c: accountData?.firstVisitStore ?? undefined,
+      Description: accountData?.description ?? undefined,
+    };
+  } else if (denpyo.customer_name) {
+    account = {
+      Name: denpyo.customer_name,
+      Phone: denpyo.contact_info ?? undefined,
+      MobilePhone2__c: denpyo.contact_info ?? undefined,
+    };
+  }
+
+  let contact: SalesforceContact | null = null;
+  if (contactAppId) {
+    const lastName =
+      contactData?.lastName ?? denpyo.customer_name ?? accountData?.name ?? '顧客';
+    contact = {
+      ...ownerField,
+      LastName: lastName,
+      FirstName: contactData?.firstName ?? undefined,
+      Phone: contactData?.phone ?? undefined,
+      Email: contactData?.email ?? undefined,
+      MobilePhone: contactData?.phone ?? undefined,
+      Kana__c: contactData?.kana ?? undefined,
+      MailingStreet: contactData?.mailingStreet ?? undefined,
+      MailingCity: contactData?.mailingCity ?? undefined,
+      MailingState: contactData?.mailingState ?? undefined,
+      MailingPostalCode: contactData?.mailingPostalCode ?? undefined,
+      Relationship__c: contactData?.relationship ?? undefined,
+      Description: contactData?.description ?? undefined,
+      Account: accountAppId ? { App_ID__c: accountAppId } : undefined,
+    };
+  } else if (denpyo.customer_name) {
+    logger.warn(`Contact をスキップ: contact_app_id が未設定（denpyo=${denpyo.id}）`);
+  }
+
+  const photographingInfo: SalesforcePhotographingInfo = {
+    ...ownerField,
+    ShootingDate__c: photographing?.shootingDate ?? undefined,
+    ShootMajor2__c: photographing?.shootMajor2 ?? undefined,
+    ShootSub2__c: photographing?.shootSub2 ?? undefined,
+    Studio__c: photographing?.studio ?? undefined,
+    NewRepeat__c: photographing?.newRepeat ?? undefined,
+    SelectIncomplete__c: photographing?.selectIncomplete ?? undefined,
+    IntroductionText__c: photographing?.introductionText ?? undefined,
+    AmountPaidCustomer__c: photographing?.amountPaidCustomer ?? undefined,
+    AmountPaidCompany__c: photographing?.amountPaidCompany ?? undefined,
+    PaymentStatus__c: photographing?.paymentStatus ?? undefined,
+    Campaign__c: photographing?.campaign ?? undefined,
+    Photographer__c: photographing?.photographerSfid18 ?? undefined,
+    ReferralStaff__c: photographing?.referralStaffSfid18 ?? undefined,
+    Selector__c: photographing?.selectorSfid18 ?? undefined,
+    Field1__c: photographing?.field1 ?? undefined,
+    sample_WEB__c: photographing?.sampleWeb ?? undefined,
+    IntroductionFlag__c: photographing?.introductionFlag ?? undefined,
+    Online_S__c: photographing?.onlineS ?? undefined,
+    Field4__c: photographing?.field4 ?? undefined,
+    Partnerflag__c: photographing?.partnerFlag ?? undefined,
+    VisitedRoute2__c: photographing?.visitedRoute2 ?? undefined,
+    ChoseReason__c: photographing?.choseReason ?? undefined,
+    IntroductionBonusContent__c: photographing?.introductionBonusContent ?? undefined,
+  };
+
+  if (accountAppId) {
+    photographingInfo.Client__r = { App_ID__c: accountAppId };
+  }
+  if (photographing?.partnerAccountAppId) {
+    photographingInfo.Partner__r = { App_ID__c: photographing.partnerAccountAppId };
+  }
+  if (photographing?.introductionCustomerAccountAppId) {
+    photographingInfo.IntroductionCustomer__r = {
+      App_ID__c: photographing.introductionCustomerAccountAppId,
+    };
+  }
+
+  const orderDetails: { appId: string; payload: SalesforceOrderDetails }[] = [];
+  for (const item of denpyo.order_items) {
+    if (!item.appId) {
+      logger.warn(`OrderDetails をスキップ: app_id 未設定（denpyo=${denpyo.id}）`);
+      continue;
+    }
+    const payload: SalesforceOrderDetails = {
+      // Master-Detail 子オブジェクトのため OwnerId は Salesforce 側で継承される
+      SalesDate__c: item.salesDate ?? undefined,
+      ShootingDate__c: item.shootingDate ?? photographing?.shootingDate ?? undefined,
+        MajorDivisions__c: item.majorDivisions ?? undefined,
+        MediumSegment__c: item.mediumSegment ?? undefined,
+        SubCategory__c: item.subCategory ?? undefined,
+        Store__c: item.store ?? photographing?.studio ?? undefined,
+        Quantity__c: item.quantity ?? undefined,
+        UnitPrice__c: item.unitPrice ?? undefined,
+        // Amount__c は Salesforce 側で UnitPrice__c × Quantity__c から自動計算される
+        // read-only 項目のため送信禁止（INVALID_FIELD_FOR_INSERT_UPDATE 防止）
+        // Amount__c: item.amount ?? undefined,
+        BillingAddress__c: item.billingAddress ?? undefined,
+        Remarks__c: item.remarks ?? undefined,
+        ServiceItem__c: item.serviceItem ?? undefined,
+      };
+    orderDetails.push({ appId: item.appId, payload });
+  }
+
+  const payments: { appId: string; payload: SalesforcePayment }[] = [];
+  for (const payment of denpyo.payments) {
+    if (!payment.appId) {
+      logger.warn(`PaymentManagement をスキップ: app_id 未設定（denpyo=${denpyo.id}）`);
+      continue;
+    }
+    const payload: SalesforcePayment = {
+      // Master-Detail 子オブジェクトのため OwnerId は Salesforce 側で継承される
+      PaymentClassification__c: payment.paymentClassification ?? undefined,
+      PaymentDay__c: payment.paymentDay ?? undefined,
+      MoneyAmount__c: payment.moneyAmount ?? undefined,
+      DepositItem__c: payment.depositItem ?? undefined,
+      PaymentDetails__c: payment.paymentDetails ?? undefined,
+      WithdrawalDate__c: payment.withdrawalDate ?? undefined,
+      Store__c: payment.store ?? photographing?.studio ?? undefined,
+      Bumon__c: payment.bumon ?? undefined,
+      Remarks__c: payment.remarks ?? undefined,
+    };
+    payments.push({ appId: payment.appId, payload });
+  }
+
+  return {
+    account: account && accountAppId ? { appId: accountAppId, payload: account } : null,
+    contact: contact && contactAppId ? { appId: contactAppId, payload: contact } : null,
+    photographingInfo: { appId: photographingAppId, payload: photographingInfo },
+    orderDetails,
+    payments,
+  };
+}
+
+/**
+ * Salesforce External-ID Upsert 共通処理
+ * - 新規: 201 + { id }
+ * - 更新: 204 (No Content)
+ * - 子（OrderDetails__c / PaymentManagement__c）は PhotographingInformation__r(App_ID__c) による外部ID参照を自動付与
+ */
+async function upsertSalesforceRecords(
+  supabase: SupabaseClient,
+  objectName: string,
+  records: Array<{ appId: string; payload: Record<string, unknown> }>,
+  denpyoAppId: string
+): Promise<{
+  successResults: Array<{ appId: string; sfId: string | null; objectName: string }>;
+  errors: string[];
+}> {
+  if (records.length === 0) {
+    return { successResults: [], errors: [] };
+  }
+
+  const errors: string[] = [];
+  const successResults: Array<{ appId: string; sfId: string | null; objectName: string }> = [];
+
+  // Composite Batch: 25件ごとに分割
+  const BATCH_SIZE = 25;
+  const batches: Array<Array<{ appId: string; payload: Record<string, unknown> }>> = [];
+  
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    batches.push(records.slice(i, i + BATCH_SIZE));
+  }
+
+  logger.info(`📦 ${objectName}: ${records.length}件を${batches.length}バッチで処理`);
+
+  // 各バッチを順次処理
+  for (const batch of batches) {
+    try {
+      const batchRequests = batch.map((record, index) => {
+        const { appId, payload } = record;
+        const upsertBody: Record<string, unknown> = { ...payload };
+        
+        // 子レコードの親参照設定
+        if (objectName === 'OrderDetails__c' || objectName === 'PaymentManagement__c') {
+          delete upsertBody.PhotographingInformation__c;
+          upsertBody.PhotographingInformation__r = { App_ID__c: denpyoAppId };
+        }
+
+        return {
+          method: 'PATCH',
+          url: `v61.0/sobjects/${objectName}/App_ID__c/${appId}`,
+          richInput: upsertBody,
+          binaryPartName: undefined,
+          binaryPartNameAlias: undefined,
+        };
+      });
+
+      const compositeBatchPayload = {
+        batchRequests,
+      };
+
+      logger.info(`🔄 Composite Batch: ${objectName} × ${batchRequests.length}件`);
+
+      const result = await callSalesforceAPI<{ results: Array<{ statusCode: number; result: unknown }> }>(
+        supabase,
+        '/services/data/v61.0/composite/batch',
+        {
+          method: 'POST',
+          body: JSON.stringify(compositeBatchPayload),
+        }
+      );
+
+      // 各サブリクエストの結果を処理
+      if (result?.results && Array.isArray(result.results)) {
+        result.results.forEach((subResult, index) => {
+          const record = batch[index];
+          const { appId } = record;
+
+          if (subResult.statusCode >= 200 && subResult.statusCode < 300) {
+            // 成功: 201(新規作成) or 204(更新)
+            const sfId = 
+              subResult.result && 
+              typeof subResult.result === 'object' && 
+              'id' in subResult.result 
+                ? (subResult.result.id as string) 
+                : null;
+
+            successResults.push({ appId, sfId, objectName });
+            logger.info(
+              `✅ ${objectName} Upsert成功: App_ID__c=${appId}${sfId ? ` → SF_ID=${sfId}` : ''}`
+            );
+          } else {
+            // 失敗
+            const errorMessage = `${objectName} Reference Upsert failed (${subResult.statusCode}): ${
+              JSON.stringify(subResult.result)
+            }`;
+            errors.push(errorMessage);
+            logger.error(`❌ ${errorMessage}`);
+          }
+        });
+      }
+    } catch (error) {
+      const errorMessage = `${objectName} Composite Batch failed: ${
+        error instanceof Error ? error.message : 'Unknown error'
+      }`;
+      errors.push(errorMessage);
+      logger.error(`❌ ${errorMessage}`);
+    }
+  }
+
+  return { successResults, errors };
+}
+
+/**
+ * 既存レコードのプレフライト照合と App_ID__c 取り付け
+ */
+async function preflightAttachAppId(
+  supabase: SupabaseClient,
+  objectName: 'Account' | 'Contact',
+  appId: string,
+  criteria: { name?: string; phone?: string; mobile?: string }
+): Promise<void> {
+  if (!PREFLIGHT_ATTACH_APP_ID) return;
+  try {
+    const soqlByAppId = new URLSearchParams({
+      q: `SELECT Id, App_ID__c FROM ${objectName} WHERE App_ID__c = '${appId}' LIMIT 1`,
+    }).toString();
+    const byAppId = await callSalesforceAPI(supabase, `/services/data/v61.0/query?${soqlByAppId}`, {
+      method: 'GET',
+    });
+    if (byAppId?.records?.length) {
+      return;
+    }
+
+    const clauses: string[] = [];
+    if (criteria.name) clauses.push(`Name = '${criteria.name.replace(/'/g, "\\'")}'`);
+    const orPhones: string[] = [];
+    if (criteria.phone) orPhones.push(`Phone = '${criteria.phone.replace(/'/g, "\\'")}'`);
+    if (criteria.mobile) {
+      if (objectName === 'Account') {
+        orPhones.push(`MobilePhone2__c = '${criteria.mobile.replace(/'/g, "\\'")}'`);
+      } else {
+        orPhones.push(
+          `(Phone = '${criteria.mobile.replace(/'/g, "\\'")}' OR MobilePhone = '${criteria.mobile.replace(/'/g, "\\'")}')`
+        );
+      }
+    }
+    if (orPhones.length) clauses.push(`(${orPhones.join(' OR ')})`);
+    if (!clauses.length) return;
+
+    const where = clauses.join(' AND ');
+    const soql = new URLSearchParams({
+      q: `SELECT Id, App_ID__c FROM ${objectName} WHERE ${where} LIMIT 2`,
+    }).toString();
+    const res = await callSalesforceAPI(supabase, `/services/data/v61.0/query?${soql}`, {
+      method: 'GET',
+    });
+    const records = Array.isArray(res?.records) ? res.records : [];
+    if (records.length === 1) {
+      const rec = records[0];
+      if (!rec?.App_ID__c) {
+        await callSalesforceAPI(supabase, `/services/data/v61.0/sobjects/${objectName}/${rec.Id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ App_ID__c: appId }),
+        });
+        logger.info(`🔧 Preflight attached App_ID__c to ${objectName}: Id=${rec.Id}`);
+      }
+    } else if (records.length > 1) {
+      logger.warn(
+        `⚠️ Preflight found multiple ${objectName} candidates. Skipped attaching App_ID__c.`
+      );
+    }
+  } catch (e) {
+    logger.warn(`⚠️ Preflight attach failed for ${objectName}:`, e);
+  }
+}
+
+/**
+ * Push処理（Supabase → Salesforce）
+ */
+async function pushToSalesforce(
+  supabase: SupabaseClient,
+  params: SyncRequest
+): Promise<SyncResponse> {
+  const startTime = Date.now();
+  const { denpyoIds, batchSize = 10, isManual = false } = params;
+
+  logger.info('🚀 Push同期開始（Supabase → Salesforce）');
+
+  const rpcArgs =
+    denpyoIds && denpyoIds.length > 0
+      ? { p_ids: denpyoIds, p_limit: null }
+      : { p_ids: null, p_limit: batchSize };
+
+  const { data: batchRows, error: batchError } = await supabase.rpc(
+    'get_denpyo_sync_status_batch',
+    rpcArgs
+  );
+
+  if (batchError) {
+    throw new Error(`同期バッチ取得エラー: ${batchError.message}`);
+  }
+
+  const rows = (batchRows ?? []) as DenpyoSyncBatchRow[];
+
+  if (rows.length === 0) {
+    return {
+      success: true,
+      data: {
+        processedCount: 0,
+        syncedCount: 0,
+        failedCount: 0,
+        failedIds: [],
+        errors: [],
+        executionTimeMs: Date.now() - startTime,
+      },
+      message: '同期対象の伝票がありません',
+    };
+  }
+
+  const denpyos = rows.map(mapBatchRowToViewRow);
+
+  logger.info(`📋 ${denpyos.length}件の伝票を同期処理中...`);
+
+  let syncedCount = 0;
+  let failedCount = 0;
+  const failedIds: string[] = [];
+  const errors: string[] = [];
+
+  for (const denpyo of denpyos) {
+    try {
+      logger.info(`📝 伝票 ${denpyo.id} を同期中...`);
+
+      const ownerIdFromSelector = await resolveOwnerIdFromSelector(
+        supabase,
+        denpyo.photographing?.selectorSfid18
+      );
+      const ownerId = ownerIdFromSelector ?? FALLBACK_OWNER_ID;
+
+      const salesforceData = transformDenpyoToSalesforce(denpyo, ownerId);
+
+      // 親系（Account/Contact）→ PhotographingInformation → 子（OrderDetails/Payment）の順でUpsert
+      let accountResult = { successResults: [], errors: [] as string[] };
+      if (salesforceData.account) {
+        accountResult = await upsertSalesforceRecords(
+          supabase,
+          'Account',
+          [salesforceData.account],
+          denpyo.id // 親app_idは子にしか使われないため何を渡してもOK。統一で denpyo.id を渡す
+        );
+      }
+
+      let contactResult = { successResults: [], errors: [] as string[] };
+      if (salesforceData.contact) {
+        contactResult = await upsertSalesforceRecords(
+          supabase,
+          'Contact',
+          [salesforceData.contact],
+          denpyo.id
+        );
+      }
+
+      if (PREFLIGHT_ATTACH_APP_ID) {
+        if (salesforceData.account) {
+          await preflightAttachAppId(supabase, 'Account', salesforceData.account.appId, {
+            name: salesforceData.account.payload.Name,
+            phone: salesforceData.account.payload.Phone as string | undefined,
+            mobile: salesforceData.account.payload.MobilePhone2__c,
+          });
+        }
+        if (salesforceData.contact) {
+          await preflightAttachAppId(supabase, 'Contact', salesforceData.contact.appId, {
+            name: salesforceData.contact.payload.LastName,
+            phone: salesforceData.contact.payload.Phone,
+            mobile: salesforceData.contact.payload.MobilePhone,
+          });
+        }
+      }
+
+      const photoResult = await upsertSalesforceRecords(
+        supabase,
+        'PhotographingInformation__c',
+        [salesforceData.photographingInfo],
+        denpyo.id
+      );
+
+      const orderResult = await upsertSalesforceRecords(
+        supabase,
+        'OrderDetails__c',
+        salesforceData.orderDetails,
+        salesforceData.photographingInfo.appId
+      );
+
+      const paymentResult = await upsertSalesforceRecords(
+        supabase,
+        'PaymentManagement__c',
+        salesforceData.payments,
+        salesforceData.photographingInfo.appId
+      );
+
+      const allErrors = [
+        ...accountResult.errors,
+        ...contactResult.errors,
+        ...photoResult.errors,
+        ...orderResult.errors,
+        ...paymentResult.errors,
+      ];
+
+      if (allErrors.length > 0) {
+        throw new Error(`Salesforce Reference Upsert エラー: ${allErrors.join('; ')}`);
+      }
+
+      const syncedTables: Record<string, unknown> = {};
+      if (accountResult.successResults.length > 0) {
+        syncedTables.accounts = {
+          status: 'synced',
+          sf_id: accountResult.successResults[0].sfId,
+          app_id: accountResult.successResults[0].appId,
+        };
+      }
+      if (contactResult.successResults.length > 0) {
+        syncedTables.contacts = {
+          status: 'synced',
+          sf_id: contactResult.successResults[0].sfId,
+          app_id: contactResult.successResults[0].appId,
+        };
+      }
+      if (photoResult.successResults.length > 0) {
+        syncedTables.photographing_information = {
+          status: 'synced',
+          sf_id: photoResult.successResults[0].sfId,
+          app_id: photoResult.successResults[0].appId,
+        };
+      }
+      if (orderResult.successResults.length > 0) {
+        syncedTables.order_details = {
+          status: 'synced',
+          count: orderResult.successResults.length,
+        };
+      }
+      if (paymentResult.successResults.length > 0) {
+        syncedTables.payment_management = {
+          status: 'synced',
+          count: paymentResult.successResults.length,
+        };
+      }
+
+      const syncMetadata = {
+        synced_tables: syncedTables,
+        sync_summary: {
+          total_tables: Object.keys(syncedTables).length,
+          sync_duration_ms: Date.now() - startTime,
+        },
+      };
+
+      const { error: syncStatusError } = await supabase.rpc('update_denpyo_sync_status', {
+        p_ids: [denpyo.id],
+        p_sync_status: 'synced',
+        p_sync_metadata: syncMetadata,
+      });
+
+      if (syncStatusError) {
+        logger.error(`⚠️ sync_status更新エラー (ID: ${denpyo.id}):`, syncStatusError);
+      } else {
+        logger.info(`✅ sync_status更新完了: ${denpyo.id} → synced`);
+      }
+
+      syncedCount++;
+      logger.info(`✅ 伝票 ${denpyo.id} 同期完了`);
+    } catch (error) {
+      failedCount++;
+      failedIds.push(denpyo.id);
+      const errorMessage = `伝票 ${denpyo.id}: ${
+        error instanceof Error ? error.message : '不明なエラー'
+      }`;
+      errors.push(errorMessage);
+      logger.error(`❌ 伝票同期エラー`, { denpyoId: denpyo.id, error: errorMessage });
+
+      try {
+        const { error: failStatusError } = await supabase.rpc('update_denpyo_sync_status', {
+          p_ids: [denpyo.id],
+          p_sync_status: 'failed',
+          p_sync_metadata: {
+            error_message: errorMessage,
+          },
+        });
+
+        if (failStatusError) {
+          logger.error(`⚠️ 失敗ステータス更新エラー (ID: ${denpyo.id}):`, failStatusError);
+        }
+      } catch (updateError) {
+        logger.error(`⚠️ 失敗ステータス更新エラー (ID: ${denpyo.id}):`, updateError);
+      }
+    }
+  }
+
+  const executionTime = Date.now() - startTime;
+  const processedCount = denpyos.length;
+
+  logger.info(
+    `🏁 Push同期完了: ${processedCount}件処理, ${syncedCount}件成功, ${failedCount}件失敗 (${executionTime}ms)`
+  );
+
+  return {
+    success: failedCount === 0,
+    data: {
+      processedCount,
+      syncedCount,
+      failedCount,
+      failedIds,
+      errors,
+      executionTimeMs: executionTime,
+    },
+    message: isManual
+      ? `手動同期完了: ${syncedCount}/${processedCount}件成功`
+      : `自動同期完了: ${syncedCount}/${processedCount}件成功`,
+  };
+}
+
+async function resolveOwnerIdFromSelector(
+  supabase: SupabaseClient,
+  selectorId?: string | null
+): Promise<string | null> {
+  if (!selectorId) {
+    return null;
+  }
+  if (responsibleOwnerCache.has(selectorId)) {
+    return responsibleOwnerCache.get(selectorId) ?? null;
+  }
+
+  try {
+    const record = await callSalesforceAPI<{ OwnerId?: string }>(
+      supabase,
+      `/services/data/${SALESFORCE_API_VERSION}/sobjects/ResponsibleMaster__c/${selectorId}?fields=OwnerId`
+    );
+    const ownerId = typeof record?.OwnerId === 'string' ? record.OwnerId : null;
+    responsibleOwnerCache.set(selectorId, ownerId);
+    return ownerId;
+  } catch (error) {
+    logger.warn(`ResponsibleMasterのOwnerId取得に失敗: ${selectorId}`, error);
+    responsibleOwnerCache.set(selectorId, null);
+    return null;
+  }
+}
+
+/**
+ * Pull処理（Salesforce → Supabase）
+ * - App_ID__c を全オブジェクトで取得
+ * - 子は親の外部ID（__r.App_ID__c）も取得し、*_app_id 連携へ
+ */
+async function pullFromSalesforce(
+  supabase: SupabaseClient,
+  params: SyncRequest
+): Promise<SyncResponse> {
+  const startTime = Date.now();
+  // batchSize: ページネーションヒント（Sforce-Query-Options用）。SOQL LIMIT句には使用しない（全件取得のため）
+  const batchSize = params.limit ?? 2000;
+  const storeId = params.storeId;
+  const syncMode = params.syncMode === 'full' ? 'full' : 'incremental';
+  const stats: SyncStats = {
+    salesforceRequestCount: 0,
+    databaseOperationCount: 0,
+  };
+
+  logger.info('🚀 Pull同期開始（Salesforce → Supabase）', {
+    syncMode,
+    batchSize,
+    storeId,
+  });
+
+  const syncResults: SyncResults = {
+    photographingInformations: 0,
+    orderDetails: 0,
+    paymentManagements: 0,
+    accounts: 0,
+    contacts: 0,
+    errors: [],
+    syncMode,
+    processedObjects: [],
+    salesforceRequestCount: 0,
+    databaseOperationCount: 0,
+  };
+
+  const context: ObjectSyncContext = {
+    supabase,
+    syncMode,
+    batchSize,
+    storeId,
+    stats,
+  };
+
+  type AccountRecord = {
+    App_ID__c?: string;
+    Name?: string;
+    Kana__c?: string;
+    BillingPostalCode?: string;
+    BillingStreet?: string;
+    BillingCity?: string;
+    BillingState?: string;
+    BillingCountry?: string;
+    Phone?: string;
+    MobilePhone2__c?: string;
+    Email__c?: string;
+    Description?: string;
+  };
+
+  type ContactRecord = {
+    App_ID__c?: string;
+    FirstName?: string;
+    LastName?: string;
+    Account?: { App_ID__c?: string };
+    Kana__c?: string;
+    TEL__c?: string;
+    PCMail__c?: string;
+    Relationship__c?: string;
+    Birthdate?: string;
+    Description?: string;
+  };
+
+  type PhotographingInformationRecord = {
+    App_ID__c?: string;
+    ShootingDate__c?: string;
+    Studio__c?: string;
+    Photographer__c?: string;
+    Selector__c?: string;
+    Client__r?: { App_ID__c?: string };
+    Partner__r?: { App_ID__c?: string };
+    IntroductionCustomer__r?: { App_ID__c?: string };
+    NewRepeat__c?: string;
+    SelectIncomplete__c?: boolean;
+    IntroductionText__c?: string;
+    Campaign__c?: string;
+    ShootMajor2__c?: string;
+    ShootSub2__c?: string;
+    Field1__c?: string;
+    sample_WEB__c?: string;
+    IntroductionFlag__c?: string;
+    Online_S__c?: boolean;
+    Field4__c?: string;
+    Partnerflag__c?: string;
+    VisitedRoute2__c?: string;
+    ChoseReason__c?: string;
+    IntroductionBonusContent__c?: string;
+  };
+
+  type OrderDetailsRecord = {
+    App_ID__c?: string;
+    SalesDate__c?: string;
+    ShootingDate__c?: string;
+    MajorDivisions__c?: string;
+    MediumSegment__c?: string;
+    SubCategory__c?: string;
+    Store__c?: string;
+    Quantity__c?: number;
+    UnitPrice__c?: number;
+    Amount__c?: number;
+    BillingAddress__c?: string;
+    Remarks__c?: string;
+    ServiceItem__c?: string;
+    PhotographingInformation__r?: { App_ID__c?: string };
+  };
+
+  type PaymentManagementRecord = {
+    App_ID__c?: string;
+    PhotographingInformation__r?: { App_ID__c?: string };
+    PaymentDay__c?: string;
+    PaymentClassification__c?: string;
+    DepositItem__c?: string;
+    MoneyAmount__c?: number;
+    WithdrawalDate__c?: string;
+    PaymentDetails__c?: string;
+    Bumon__c?: string;
+    Store__c?: string;
+    Remarks__c?: string;
+  };
+
+  const accountDefinition: ObjectSyncDefinition<AccountRecord> = {
+    objectName: 'Account',
+    fields: [
+      'Id',
+      'App_ID__c',
+      'Name',
+      'Kana__c',
+      'BillingPostalCode',
+      'BillingStreet',
+      'BillingCity',
+      'BillingState',
+      'BillingCountry',
+      'Phone',
+      'MobilePhone2__c',
+      'Email__c',
+      'Description',
+      'RecordTypeId',
+      'StoreStudioOwner__c',
+      'LastModifiedDate',
+    ],
+    baseConditions: ['IsDeleted = false', 'App_ID__c != null'],
+    storeCondition: (store) => `StoreStudioOwner__c = '${store}'`,
+    rpcName: 'sync_salesforce_accounts',
+    resultKey: 'accounts',
+    mapRecord: (acc: AccountRecord) => ({
+      app_id: acc.App_ID__c,
+      name: acc.Name,
+      kana: acc.Kana__c,
+      billing_postal_code: acc.BillingPostalCode,
+      billing_street: acc.BillingStreet,
+      billing_city: acc.BillingCity,
+      billing_state: acc.BillingState,
+      billing_country: acc.BillingCountry,
+      phone: acc.Phone,
+      mobile_phone2: acc.MobilePhone2__c,
+      email: acc.Email__c,
+      description: acc.Description,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+  };
+
+  const contactDefinition: ObjectSyncDefinition<ContactRecord> = {
+    objectName: 'Contact',
+    fields: [
+      'Id',
+      'App_ID__c',
+      'FirstName',
+      'LastName',
+      'AccountId',
+      'Account.App_ID__c',
+      'Kana__c',
+      'Sex__c',
+      'Birthdate',
+      'Age__c',
+      'TEL__c',
+      'MobilePhone__c',
+      'PCMail__c',
+      'PhoneMail__c',
+      'Relationship__c',
+      'Description',
+      'Account.StoreStudioOwner__c',
+      'LastModifiedDate',
+    ],
+    baseConditions: ['IsDeleted = false', 'App_ID__c != null'],
+    storeCondition: (store) => `Account.StoreStudioOwner__c = '${store}'`,
+    rpcName: 'sync_salesforce_contacts',
+    resultKey: 'contacts',
+    mapRecord: (contact: ContactRecord) => ({
+      app_id: contact.App_ID__c,
+      first_name: contact.FirstName,
+      last_name: contact.LastName,
+      account_app_id: contact.Account ? contact.Account.App_ID__c : null,
+      kana: contact.Kana__c,
+      phone: contact.TEL__c,
+      email: contact.PCMail__c,
+      relationship: contact.Relationship__c,
+      birthdate: contact.Birthdate,
+      description: contact.Description,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+  };
+
+  const photographingDefinition: ObjectSyncDefinition<PhotographingInformationRecord> = {
+    objectName: 'PhotographingInformation__c',
+    fields: [
+      'Id',
+      'App_ID__c',
+      'ShootingDate__c',
+      'Studio__c',
+      'Photographer__c',
+      'Selector__c',
+      'Client__c',
+      'Client__r.App_ID__c',
+      'Partner__c',
+      'Partner__r.App_ID__c',
+      'IntroductionCustomer__c',
+      'IntroductionCustomer__r.App_ID__c',
+      'NewRepeat__c',
+      'SelectIncomplete__c',
+      'IntroductionText__c',
+      'Campaign__c',
+      'ShootMajor2__c',
+      'ShootSub2__c',
+      'Field1__c',
+      'sample_WEB__c',
+      'IntroductionFlag__c',
+      'Online_S__c',
+      'Field4__c',
+      'Partnerflag__c',
+      'VisitedRoute2__c',
+      'ChoseReason__c',
+      'IntroductionBonusContent__c',
+      'LastModifiedDate',
+    ],
+    baseConditions: ['IsDeleted = false', 'App_ID__c != null'],
+    storeCondition: (store) => `Studio__c = '${store}'`,
+    rpcName: 'sync_salesforce_photographing_informations',
+    resultKey: 'photographingInformations',
+    mapRecord: (pi: PhotographingInformationRecord) => ({
+      app_id: pi.App_ID__c,
+      shooting_date: pi.ShootingDate__c,
+      studio: pi.Studio__c,
+      photographer_sfid_18: pi.Photographer__c,
+      selector_sfid_18: pi.Selector__c,
+      client_account_app_id: pi.Client__r ? pi.Client__r.App_ID__c : null,
+      partner_account_app_id: pi.Partner__r ? pi.Partner__r.App_ID__c : null,
+      introduction_customer_account_app_id: pi.IntroductionCustomer__r
+        ? pi.IntroductionCustomer__r.App_ID__c
+        : null,
+      new_repeat: pi.NewRepeat__c,
+      select_incomplete: pi.SelectIncomplete__c,
+      introduction_text: pi.IntroductionText__c,
+      campaign: pi.Campaign__c,
+      shoot_major2: pi.ShootMajor2__c,
+      shoot_sub2: pi.ShootSub2__c,
+      field1: pi.Field1__c,
+      sample_web: pi.sample_WEB__c,
+      introduction_flag: pi.IntroductionFlag__c,
+      online_s: pi.Online_S__c,
+      field4: pi.Field4__c,
+      partnerflag: pi.Partnerflag__c,
+      visited_route2: pi.VisitedRoute2__c,
+      chose_reason: pi.ChoseReason__c,
+      introduction_bonus_content: pi.IntroductionBonusContent__c,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }),
+  };
+
+  const orderDetailsDefinition: ObjectSyncDefinition<OrderDetailsRecord> = {
+    objectName: 'OrderDetails__c',
+    fields: [
+      'Id',
+      'App_ID__c',
+      'SalesDate__c',
+      'ShootingDate__c',
+      'MajorDivisions__c',
+      'MediumSegment__c',
+      'SubCategory__c',
+      'Store__c',
+      'Quantity__c',
+      'UnitPrice__c',
+      'Amount__c',
+      'BillingAddress__c',
+      'Remarks__c',
+      'ServiceItem__c',
+      'PhotographingInformation__c',
+      'PhotographingInformation__r.App_ID__c',
+      'LastModifiedDate',
+    ],
+    baseConditions: ['IsDeleted = false', 'App_ID__c != null'],
+    storeCondition: (store) => `Store__c = '${store}'`,
+    rpcName: 'sync_salesforce_order_details',
+    resultKey: 'orderDetails',
+    mapRecord: (od: OrderDetailsRecord) => {
+      const piAppId = od.PhotographingInformation__r?.App_ID__c;
+      return {
+        app_id: od.App_ID__c,
+        sales_date: od.SalesDate__c,
+        shooting_date: od.ShootingDate__c,
+        major_divisions: od.MajorDivisions__c,
+        medium_segment: od.MediumSegment__c,
+        sub_category: od.SubCategory__c,
+        store: od.Store__c,
+        quantity: od.Quantity__c,
+        unit_price: od.UnitPrice__c,
+        amount: od.Amount__c,
+        billing_address: od.BillingAddress__c,
+        remarks: od.Remarks__c,
+        service_item: od.ServiceItem__c,
+        photographing_information_app_id: isValidUUID(piAppId) ? piAppId : null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+    },
+  };
+
+  const paymentManagementDefinition: ObjectSyncDefinition<PaymentManagementRecord> = {
+    objectName: 'PaymentManagement__c',
+    fields: [
+      'Id',
+      'App_ID__c',
+      'PhotographingInformation__c',
+      'PhotographingInformation__r.App_ID__c',
+      'PaymentDay__c',
+      'PaymentClassification__c',
+      'DepositItem__c',
+      'MoneyAmount__c',
+      'WithdrawalDate__c',
+      'PaymentDetails__c',
+      'Bumon__c',
+      'Store__c',
+      'Remarks__c',
+      'LastModifiedDate',
+    ],
+    baseConditions: ['IsDeleted = false', 'App_ID__c != null'],
+    rpcName: 'sync_salesforce_payment_managements',
+    resultKey: 'paymentManagements',
+    mapRecord: (pm: PaymentManagementRecord) => {
+      const piAppId = pm.PhotographingInformation__r?.App_ID__c;
+      return {
+        app_id: pm.App_ID__c,
+        payment_classification: pm.PaymentClassification__c,
+        payment_day: pm.PaymentDay__c,
+        money_amount: pm.MoneyAmount__c,
+        photographing_information_app_id: isValidUUID(piAppId) ? piAppId : null,
+        deposit_item: pm.DepositItem__c,
+        withdrawal_date: pm.WithdrawalDate__c,
+        payment_details: pm.PaymentDetails__c,
+        bumon: pm.Bumon__c,
+        store: pm.Store__c,
+        remarks: pm.Remarks__c,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+    },
+  };
+
+  const definitions = [
+    accountDefinition,
+    contactDefinition,
+    photographingDefinition,
+    orderDetailsDefinition,
+    paymentManagementDefinition,
+  ] as const;
+  const objectNames = definitions.map((definition) => definition.objectName);
+  const startedAtIso = new Date().toISOString();
+  let logId: string | null = null;
+
+  try {
+    const { data: insertedLogId, error: logError } = await supabase.rpc(
+      'insert_salesforce_transaction_sync_log',
+      {
+        p_sync_mode: syncMode,
+        p_object_names: objectNames,
+        p_status: 'in_progress',
+        p_started_at: startedAtIso,
+        p_triggered_by: params.triggeredBy ?? null,
+        p_is_manual: params.isManual ?? false,
+      }
+    );
+    if (logError) {
+      logger.warn('⚠️ transaction_sync_logs への初期書き込みに失敗しました', logError);
+    } else if (typeof insertedLogId === 'string') {
+      logId = insertedLogId;
+    }
+  } catch (logInitError) {
+    logger.warn('⚠️ Salesforce取引同期ログの初期化に失敗しました', logInitError);
+  }
+
+  // Composite Batch: 全オブジェクトのSOQLクエリを1回で実行
+  try {
+    logger.info('🚀 Composite Batch で全オブジェクトのクエリを実行');
+
+    // 各オブジェクトのSOQLクエリを構築
+    const batchRequests = await Promise.all(
+      definitions.map(async (definition) => {
+        const cursor = syncMode === 'full' ? null : await getSyncCursor(supabase, definition.objectName);
+        const lastSyncedIso = cursor?.last_synced_at ? normalizeSalesforceTimestamp(cursor.last_synced_at) : null;
+
+        const conditions: string[] = [...definition.baseConditions];
+        if (storeId && definition.storeCondition) {
+          conditions.push(definition.storeCondition(storeId));
+        }
+        if (syncMode === 'incremental' && lastSyncedIso) {
+          conditions.push(`LastModifiedDate >= ${toSoqlDateTimeLiteral(lastSyncedIso)}`);
+        }
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const soql = `SELECT ${definition.fields.join(', ')} FROM ${definition.objectName} ${whereClause} ORDER BY LastModifiedDate ASC`;
+
+        return {
+          method: 'GET',
+          url: `v61.0/query?q=${encodeURIComponent(soql)}`,
+          binaryPartName: undefined,
+          binaryPartNameAlias: undefined,
+        };
+      })
+    );
+
+    const compositeBatchPayload = {
+      batchRequests,
+    };
+
+    stats.salesforceRequestCount += 1;
+    const result = await callSalesforceAPI<{ results: Array<{ statusCode: number; result: SalesforceQueryResponse<unknown> }> }>(
+      supabase,
+      '/services/data/v61.0/composite/batch',
+      {
+        method: 'POST',
+        body: JSON.stringify(compositeBatchPayload),
+      }
+    );
+
+    logger.info('✅ Composite Batch 実行完了');
+
+    // 各オブジェクトの結果を処理
+    if (result?.results && Array.isArray(result.results)) {
+      for (let i = 0; i < result.results.length; i++) {
+        const subResult = result.results[i];
+        const definition = definitions[i];
+
+        if (subResult.statusCode >= 200 && subResult.statusCode < 300) {
+          const queryResponse = subResult.result as SalesforceQueryResponse<unknown>;
+          let records = Array.isArray(queryResponse.records) ? queryResponse.records : [];
+
+          // nextRecordsUrl がある場合は追加取得
+          if (queryResponse.nextRecordsUrl) {
+            logger.info(`📡 ${definition.objectName}: 追加ページを取得中`);
+            const additionalRecords = await fetchSalesforceQueryAll(
+              supabase,
+              '',
+              batchSize,
+              stats,
+              queryResponse.nextRecordsUrl
+            );
+            records = [...records, ...additionalRecords];
+          }
+
+          logger.info(`📊 ${definition.objectName}取得結果: ${records.length}件`);
+
+          // フィルタリングとDB保存
+          const cursor = syncMode === 'full' ? null : await getSyncCursor(supabase, definition.objectName);
+          const lastSyncedIso = cursor?.last_synced_at ? normalizeSalesforceTimestamp(cursor.last_synced_at) : null;
+          const processedIds = Array.isArray(cursor?.last_synced_ids)
+            ? cursor?.last_synced_ids.filter((id): id is string => typeof id === 'string')
+            : [];
+
+          const filtered = syncMode === 'incremental'
+            ? filterByCursor(records, lastSyncedIso, processedIds)
+            : records;
+
+          if (filtered.length === 0) {
+            if (syncMode === 'incremental') {
+              await saveSyncCursor(supabase, definition.objectName, lastSyncedIso, processedIds);
+            }
+            logger.info(`ℹ️ ${definition.objectName}: 差分なし`);
+            syncResults.processedObjects.push(definition.objectName);
+            continue;
+          }
+
+          // DB保存
+          let syncedCount = 0;
+          for (const chunk of chunkArray(filtered, RPC_CHUNK_SIZE)) {
+            const payload = chunk.map(definition.mapRecord);
+            stats.databaseOperationCount += 1;
+            const { data, error } = await supabase.rpc(definition.rpcName, {
+              p_records: payload,
+            });
+            if (error) {
+              throw new Error(`${definition.rpcName} エラー: ${error.message}`);
+            }
+            const increment = typeof data === 'number' ? data : payload.length;
+            syncedCount += increment;
+          }
+
+          const maxTimestamp = computeMaxTimestamp(filtered) ?? new Date().toISOString();
+          const idsAtMax = collectIdsAtTimestamp(filtered, maxTimestamp);
+          await saveSyncCursor(supabase, definition.objectName, maxTimestamp, idsAtMax);
+
+          syncResults[definition.resultKey] += syncedCount;
+          syncResults.processedObjects.push(definition.objectName);
+          logger.info(`✅ ${definition.objectName}: ${syncedCount}件同期完了`);
+        } else {
+          const errorMessage = `${definition.objectName} クエリ失敗 (${subResult.statusCode})`;
+          syncResults.errors.push(errorMessage);
+          logger.error(`❌ ${errorMessage}`);
+        }
+      }
+    }
+  } catch (error) {
+    const errorMessage = `Composite Batch 実行エラー: ${error instanceof Error ? error.message : String(error)}`;
+    syncResults.errors.push(errorMessage);
+    logger.error('❌', errorMessage, error);
+  }
+
+  syncResults.salesforceRequestCount = stats.salesforceRequestCount;
+  syncResults.databaseOperationCount = stats.databaseOperationCount;
+
+  const executionTime = Date.now() - startTime;
+  const totalSynced =
+    syncResults.photographingInformations +
+    syncResults.orderDetails +
+    syncResults.paymentManagements +
+    syncResults.accounts +
+    syncResults.contacts;
+  const success = syncResults.errors.length === 0;
+  const completedAtIso = new Date().toISOString();
+
+  if (logId) {
+    const { error: logUpdateError } = await supabase.rpc(
+      'update_salesforce_transaction_sync_log',
+      {
+        p_id: logId,
+        p_status: success ? 'success' : 'failed',
+        p_synced_count: totalSynced,
+        p_error_count: syncResults.errors.length,
+        p_salesforce_request_count: syncResults.salesforceRequestCount,
+        p_database_operation_count: syncResults.databaseOperationCount,
+        p_errors: syncResults.errors.length > 0 ? syncResults.errors : null,
+        p_completed_at: completedAtIso,
+        p_updated_at: completedAtIso,
+      }
+    );
+    if (logUpdateError) {
+      logger.warn('⚠️ transaction_sync_logs の更新に失敗しました', logUpdateError);
+    }
+  }
+
+  logger.info('✅ Pull同期完了', { syncResults, executionTime });
+
+  return {
+    success,
+    data: {
+      ...syncResults,
+      executionTimeMs: executionTime,
+      totalSynced,
+    },
+    message: `同期完了(${syncMode}): PI=${syncResults.photographingInformations}件, OD=${syncResults.orderDetails}件, PM=${syncResults.paymentManagements}件, Acc=${syncResults.accounts}件, Con=${syncResults.contacts}件, Requests=${syncResults.salesforceRequestCount}, DBOps=${syncResults.databaseOperationCount} (${executionTime}ms)`,
+  };
+}
+
+// === メインハンドラー ===
+
+Deno.serve(async (req: Request) => {
+  try {
+    logger.info('🚀 Salesforce Transaction Sync Edge Function 開始');
+
+    if (req.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 200,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info',
+        },
+      });
+    }
+
+    if (req.method !== 'POST') {
+      return new Response(JSON.stringify({ success: false, message: 'POST method required' }), {
+        status: 405,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
+    }
+
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+    if (!supabaseUrl || !supabaseServiceKey) {
+      throw new Error('Supabase環境変数が設定されていません');
+    }
+
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+    const requestBody = (await req.json()) as SyncRequest;
+
+    logger.info('🔧 同期設定:', requestBody);
+
+    let response: SyncResponse;
+
+    if (requestBody.direction === 'push') {
+      response = await pushToSalesforce(supabase, requestBody);
+    } else if (requestBody.direction === 'pull') {
+      response = await pullFromSalesforce(supabase, requestBody);
+    } else {
+      throw new Error('Invalid direction parameter. Must be "push" or "pull"');
+    }
+
+    return new Response(JSON.stringify(response), {
+      status: response.success ? 200 : 207,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info',
+      },
+    });
+  } catch (error) {
+    logger.error('❌ Edge Function エラー:', error);
+
+    return new Response(
+      JSON.stringify({
+        success: false,
+        message: `同期処理エラー: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        error: error instanceof Error
+          ? {
+              name: error.name,
+              message: error.message,
+              stack: error.stack,
+            }
+          : error,
+      }),
+      {
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info',
+        },
+      }
+    );
+  }
+});
